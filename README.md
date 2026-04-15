@@ -1,111 +1,169 @@
-# Multi-Container Runtime
-
-A lightweight Linux container runtime in C with a long-running supervisor and a kernel-space memory monitor.
-
-Read [`project-guide.md`](project-guide.md) for the full project specification.
+# OS Jackfruit Project –Kernel Module Monitoring & Container Supervision
 
 ---
 
-## Getting Started
+# 1. Team Information
 
-### 1. Fork the Repository
+Team Members:
 
-1. Go to [github.com/shivangjhalani/OS-Jackfruit](https://github.com/shivangjhalani/OS-Jackfruit)
-2. Click **Fork** (top-right)
-3. Clone your fork:
+* Rakshitha K B – SRN: PES2UG24CS918
+* Mythri B H – SRN: PES2UG24CS290
 
-```bash
-git clone https://github.com/<your-username>/OS-Jackfruit.git
-cd OS-Jackfruit
-```
+---
 
-### 2. Set Up Your VM
+# 2. Build, Load, and Run Instructions
 
-You need an **Ubuntu 22.04 or 24.04** VM with **Secure Boot OFF**. WSL will not work.
+## Step 1: Build the Project
 
-Install dependencies:
+make
 
-```bash
-sudo apt update
-sudo apt install -y build-essential linux-headers-$(uname -r)
-```
+## Step 2: Load Kernel Module
 
-### 3. Run the Environment Check
+sudo insmod monitor.ko
 
-```bash
-cd boilerplate
-chmod +x environment-check.sh
-sudo ./environment-check.sh
-```
+## Step 3: Verify Device
 
-Fix any issues reported before moving on.
+ls -l /dev/container_monitor
 
-### 4. Prepare the Root Filesystem
+## Step 4: Start Supervisor
 
-```bash
-mkdir rootfs-base
-wget https://dl-cdn.alpinelinux.org/alpine/v3.20/releases/x86_64/alpine-minirootfs-3.20.3-x86_64.tar.gz
-tar -xzf alpine-minirootfs-3.20.3-x86_64.tar.gz -C rootfs-base
+sudo ./engine supervisor ./rootfs-base
 
-# Make one writable copy per container you plan to run
+## Step 5: Create Writable Root Filesystems
+
 cp -a ./rootfs-base ./rootfs-alpha
 cp -a ./rootfs-base ./rootfs-beta
-```
 
-Do not commit `rootfs-base/` or `rootfs-*` directories to your repository.
+## Step 6: Start Containers
 
-### 5. Understand the Boilerplate
+sudo ./engine start alpha ./rootfs-alpha /bin/sh --soft-mib 48 --hard-mib 80
+sudo ./engine start beta ./rootfs-beta /bin/sh --soft-mib 64 --hard-mib 96
 
-The `boilerplate/` folder contains starter files:
+## Step 7: List Containers
 
-| File                   | Purpose                                             |
-| ---------------------- | --------------------------------------------------- |
-| `engine.c`             | User-space runtime and supervisor skeleton          |
-| `monitor.c`            | Kernel module skeleton                              |
-| `monitor_ioctl.h`      | Shared ioctl command definitions                    |
-| `Makefile`             | Build targets for both user-space and kernel module |
-| `cpu_hog.c`            | CPU-bound test workload                             |
-| `io_pulse.c`           | I/O-bound test workload                             |
-| `memory_hog.c`         | Memory-consuming test workload                      |
-| `environment-check.sh` | VM environment preflight check                      |
+sudo ./engine ps
 
-Use these as your starting point. You are free to restructure the repository however you want — the submission requirements are listed in the project guide.
+## Step 8: View Logs
 
-### 6. Build and Verify
+sudo ./engine logs alpha
 
-```bash
-cd boilerplate
-make
-```
+## Step 9: Run Workloads
 
-If this compiles without errors, your environment is ready.
+(Execute memory or CPU stress programs inside containers)
 
-### 7. GitHub Actions Smoke Check
+## Step 10: Stop Containers
 
-Your fork will inherit a minimal GitHub Actions workflow from this repository.
+sudo ./engine stop alpha
+sudo ./engine stop beta
 
-That workflow only performs CI-safe checks:
+## Step 11: Check Kernel Logs
 
-- `make -C boilerplate ci`
-- user-space binary compilation (`engine`, `memory_hog`, `cpu_hog`, `io_pulse`)
-- `./boilerplate/engine` with no arguments must print usage and exit with a non-zero status
+dmesg | tail
 
-The CI-safe build command is:
+## Step 12: Unload Module
 
-```bash
-make -C boilerplate ci
-```
-
-This smoke check does not test kernel-module loading, supervisor runtime behavior, or container execution.
+sudo rmmod monitor
 
 ---
 
-## What to Do Next
+# 3. Demo with Screenshots
 
-Read [`project-guide.md`](project-guide.md) end to end. It contains:
+The following demonstrations were performed with screenshots:
 
-- The six implementation tasks (multi-container runtime, CLI, logging, kernel monitor, scheduling experiments, cleanup)
-- The engineering analysis you must write
-- The exact submission requirements, including what your `README.md` must contain (screenshots, analysis, design decisions)
+1. Multi-container supervision
+   → Shows multiple containers running under a single supervisor
 
-Your fork's `README.md` should be replaced with your own project documentation as described in the submission package section of the project guide. (As in get rid of all the above content and replace with your README.md)
+2. Metadata tracking
+   → Output of `engine ps` showing container details
+
+3. Bounded-buffer logging
+   → Logs showing producer-consumer behavior
+
+4. CLI and IPC
+   → CLI command interaction with supervisor
+
+5. Soft-limit warning
+   → dmesg output showing soft memory limit exceeded
+
+6. Hard-limit enforcement
+   → dmesg output showing process termination
+
+7. Scheduling experiment
+   → Output comparison of workloads
+
+8. Clean teardown
+   → No zombie processes after stopping containers
+
+(All screenshots are included in the screenshots folder with captions)
+
+---
+
+# 4. Engineering Analysis
+
+This project demonstrates key operating system concepts including process isolation, scheduling, and kernel-level monitoring.
+
+The kernel module periodically monitors memory usage of processes using RSS values. Soft and hard limits are enforced to detect abnormal behavior. The supervisor manages multiple containers and coordinates execution using IPC mechanisms.
+
+The project highlights how Linux handles process scheduling and resource allocation. Kernel-level monitoring provides deeper insights compared to user-space tools.
+
+---
+
+# 5. Design Decisions and Tradeoffs
+
+## Namespace Isolation
+
+Choice: Used container-based isolation
+Tradeoff: Slight overhead in setup
+Justification: Provides process separation and safety
+
+## Supervisor Architecture
+
+Choice: Central supervisor process
+Tradeoff: Single point of control
+Justification: Easier management of containers
+
+## IPC and Logging
+
+Choice: CLI-based interaction and logging pipeline
+Tradeoff: Added complexity
+Justification: Enables communication and monitoring
+
+## Kernel Monitor
+
+Choice: Timer-based monitoring
+Tradeoff: Periodic overhead
+Justification: Efficient and simple implementation
+
+## Scheduling Experiments
+
+Choice: Multiple workload comparison
+Tradeoff: Requires controlled setup
+Justification: Demonstrates real OS scheduling behavior
+
+---
+
+# 6. Scheduler Experiment Results
+
+Experiments were conducted by running workloads across multiple containers.
+
+Observations:
+
+* CPU-intensive tasks showed higher execution time under contention
+* Memory-heavy workloads triggered soft and hard limits
+* Scheduling behavior varied based on workload distribution
+
+Sample Comparison:
+
+Workload A vs Workload B
+
+* A: Faster completion under low load
+* B: Slower under contention
+
+Conclusion:
+The results demonstrate how Linux scheduling dynamically allocates CPU resources based on process demand and system load.
+
+---
+
+# Conclusion
+
+Task 6 successfully demonstrated kernel-level monitoring and multi-container supervision. The project provided practical exposure to OS internals, process scheduling, and resource management.
