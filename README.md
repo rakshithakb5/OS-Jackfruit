@@ -1,169 +1,181 @@
-# OS Jackfruit Project –Kernel Module Monitoring & Container Supervision
+# OS-Jackfruit: Lightweight Container Engine in C
+
+## Team Information
+- **Name 1:** Mythri B H
+  **SRN 1:** PES2UG24CS290
+- **Name 2:** Rakshitha K B
+  **SRN 2:** PES2UG24CS918
 
 ---
 
-# 1. Team Information
+## Project Overview
+OS-Jackfruit is a lightweight containerization engine built for Linux. It demonstrates core operating system concepts including:
+- Resource isolation through **namespaces**
+- Filesystem sandboxing with **chroot**
+- Kernel-to-user-space communication using a **custom Kernel Module**
 
-Team Members:
-
-* Rakshitha K B – SRN: PES2UG24CS918
-* Mythri B H – SRN: PES2UG24CS290
+This project provides a practical understanding of container runtime internals, kernel-level monitoring, and scheduling mechanisms in Linux.
 
 ---
 
-# 2. Build, Load, and Run Instructions
+## Features
 
-## Step 1: Build the Project
+### Container Engine
+- Creation and management of multiple containers
+- Process isolation using `clone()`, `chroot()`, and Linux namespaces
+- Execution of custom commands within containers
 
+### Supervisor System
+- Central supervisor process (`engine.c`) manages container lifecycle
+- Tracks container metadata (PID, status, uptime)
+- Prevents zombie processes via `waitpid`
+
+### CLI Communication
+- Communication between CLI and supervisor using UNIX domain sockets
+- Supported commands:
+  - `start`
+  - `stop`
+  - `ps`
+  - `logs`
+
+### Logging System
+- Bounded buffer implementation for logging
+- Logs captured via pipes
+- Dedicated logging thread writes logs to files
+
+### Memory Monitoring (Kernel Module)
+- Custom kernel module (`monitor.c`)
+- Detects:
+  - Soft memory limit violations
+  - Hard memory limit violations
+- Logs generated via kernel logging (`dmesg`)
+
+### CPU Scheduling Experiment
+- Demonstrates the effect of **nice values** on process scheduling
+- Shows impact of priority on execution time
+
+---
+
+## Project Structure
+
+```
+
+boilerplate/
+│── engine.c          # Container runtime and CLI
+│── monitor.c         # Kernel module for memory monitoring
+│── cpu_task.c        # CPU scheduling experiment
+│── memory_hog.c      # Memory stress program
+│── io_pulse.c        # I/O workload generator
+│── Makefile          # Build configuration
+│── rootfs/           # Root filesystem for containers
+│── screenshots/      # Output screenshots
+```
+
+
+---
+
+## Build, Load & Set Instructions
+
+### Build Everything
+```bash
 make
+```
 
-## Step 2: Load Kernel Module
-
+### Load the Kernel Monitor and Set Permissions
+```bash
 sudo insmod monitor.ko
+sudo chmod 666 /dev/container_monitor
+```
 
-## Step 3: Verify Device
-
-ls -l /dev/container_monitor
-
-## Step 4: Start Supervisor
-
-sudo ./engine supervisor ./rootfs-base
-
-## Step 5: Create Writable Root Filesystems
-
+### Create Container Root Filesystems
+```bash
 cp -a ./rootfs-base ./rootfs-alpha
-cp -a ./rootfs-base ./rootfs-beta
+```
 
-## Step 6: Start Containers
-
+### Start a Container with Memory Limits
+```bash
 sudo ./engine start alpha ./rootfs-alpha /bin/sh --soft-mib 48 --hard-mib 80
-sudo ./engine start beta ./rootfs-beta /bin/sh --soft-mib 64 --hard-mib 96
+```
 
-## Step 7: List Containers
-
+### Check Tracking and Logs
+```bash
 sudo ./engine ps
+sudo dmesg | tail
+```
 
-## Step 8: View Logs
-
-sudo ./engine logs alpha
-
-## Step 9: Run Workloads
-
-(Execute memory or CPU stress programs inside containers)
-
-## Step 10: Stop Containers
-
+### Teardown
+```bash
 sudo ./engine stop alpha
-sudo ./engine stop beta
-
-## Step 11: Check Kernel Logs
-
-dmesg | tail
-
-## Step 12: Unload Module
-
 sudo rmmod monitor
+make clean
+```
 
----
+### Design Decisions
+- Isolation
+Used clone() system calls with flags (CLONE_NEWPID, CLONE_NEWNS, CLONE_NEWUTS) to ensure each container has its own process tree and hostname.
+- Communication
+Implemented a character device driver (/dev/container_monitor) to bridge User-Space Engine and Kernel-Space Monitor.
+- Filesystem
+Used Alpine Linux minirootfs for minimal footprint and efficiency.
 
-# 3. Demo with Screenshots
+## Engineering Analysis
 
-The following demonstrations were performed with screenshots:
+### Isolation Mechanisms
+- PID Namespace: Containers have their own process tree; PID 1 inside container is isolated from host.
+- UTS Namespace: Independent hostname per container.
+- Mount Namespace & Chroot: Filesystem isolation using Alpine minirootfs.
+- Shared Kernel: All containers share the host kernel system call interface and MMU.
 
-1. Multi-container supervision
-   → Shows multiple containers running under a single supervisor
+### Supervisor and Process Lifecycle
+- Supervisor (engine.c) manages container lifecycle.
+- Prevents zombie processes using waitpid.
+- Tracks Host PID and communicates with Kernel Monitor via IOCTL.
 
-2. Metadata tracking
-   → Output of `engine ps` showing container details
+### IPC and Synchronization
+- IOCTL: Registers container PID with kernel monitor.
+- Race Conditions: Avoided using mutexes/spinlocks in kernel module for atomic logging.
 
-3. Bounded-buffer logging
-   → Logs showing producer-consumer behavior
+### Memory Management and Enforcement
+- RSS (Resident Set Size): Measures memory held in RAM.
+- Limits: Soft limits warn; hard limits trigger OOM killer.
+- Kernel Enforcement: Only kernel can safely enforce memory allocation limits.
 
-4. CLI and IPC
-   → CLI command interaction with supervisor
+### Scheduling Behavior
+- Linux Completely Fair Scheduler (CFS) manages workloads.
+- Lightweight runtime ensures near-zero scheduling overhead.
+- Containers remain responsive compared to VMs.
 
-5. Soft-limit warning
-   → dmesg output showing soft memory limit exceeded
+### Experiments and Results
+- Multi-container supervision under a single supervisor process
+- Container metadata tracking (PID, status, uptime)
+- Logging system using bounded buffer and pipes
+- CLI communication via UNIX domain sockets
+- Detection of soft and hard memory limits
+- CPU scheduling behavior based on nice values
+- Clean container termination without zombie processes
 
-6. Hard-limit enforcement
-   → dmesg output showing process termination
+### Technologies Used
+- C Programming Language
+- Linux System Calls
+- UNIX Domain Sockets
+- Linux Kernel Modules
+- Process Scheduling (nice values)
 
-7. Scheduling experiment
-   → Output comparison of workloads
+### Concepts Covered
+- Process Management
+- Inter-Process Communication (IPC)
+- Memory Management
+- Kernel-Level Programming
+- CPU Scheduling
 
-8. Clean teardown
-   → No zombie processes after stopping containers
+### Conclusion
+OS-Jackfruit demonstrates how container runtimes can be built from scratch using Linux primitives. It highlights process isolation, IPC, memory enforcement, and scheduling, serving as a compact demonstration of core operating system principles applied in a real-world system.
 
-(All screenshots are included in the screenshots folder with captions)
+### Authors
+- Mythri B H (PES2UG24CS290)
+- Rakshitha K B (PES2UG24CS918)
 
----
-
-# 4. Engineering Analysis
-
-This project demonstrates key operating system concepts including process isolation, scheduling, and kernel-level monitoring.
-
-The kernel module periodically monitors memory usage of processes using RSS values. Soft and hard limits are enforced to detect abnormal behavior. The supervisor manages multiple containers and coordinates execution using IPC mechanisms.
-
-The project highlights how Linux handles process scheduling and resource allocation. Kernel-level monitoring provides deeper insights compared to user-space tools.
-
----
-
-# 5. Design Decisions and Tradeoffs
-
-## Namespace Isolation
-
-Choice: Used container-based isolation
-Tradeoff: Slight overhead in setup
-Justification: Provides process separation and safety
-
-## Supervisor Architecture
-
-Choice: Central supervisor process
-Tradeoff: Single point of control
-Justification: Easier management of containers
-
-## IPC and Logging
-
-Choice: CLI-based interaction and logging pipeline
-Tradeoff: Added complexity
-Justification: Enables communication and monitoring
-
-## Kernel Monitor
-
-Choice: Timer-based monitoring
-Tradeoff: Periodic overhead
-Justification: Efficient and simple implementation
-
-## Scheduling Experiments
-
-Choice: Multiple workload comparison
-Tradeoff: Requires controlled setup
-Justification: Demonstrates real OS scheduling behavior
-
----
-
-# 6. Scheduler Experiment Results
-
-Experiments were conducted by running workloads across multiple containers.
-
-Observations:
-
-* CPU-intensive tasks showed higher execution time under contention
-* Memory-heavy workloads triggered soft and hard limits
-* Scheduling behavior varied based on workload distribution
-
-Sample Comparison:
-
-Workload A vs Workload B
-
-* A: Faster completion under low load
-* B: Slower under contention
-
-Conclusion:
-The results demonstrate how Linux scheduling dynamically allocates CPU resources based on process demand and system load.
-
----
-
-# Conclusion
-
-Task 6 successfully demonstrated kernel-level monitoring and multi-container supervision. The project provided practical exposure to OS internals, process scheduling, and resource management.
+### Notes
+- Run commands with sudo where required
+- Ensure Linux kernel headers are installed before building the module
+- Tested on Ubuntu Linux
