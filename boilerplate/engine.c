@@ -289,11 +289,24 @@ static void bounded_buffer_begin_shutdown(bounded_buffer_t *buffer)
  */
 int bounded_buffer_push(bounded_buffer_t *buffer, const log_item_t *item)
 {
-    (void)buffer;
-    (void)item;
-    return -1;
-}
+    pthread_mutex_lock(&buffer->mutex);
 
+    while (buffer->count == LOG_BUFFER_CAPACITY && !buffer->shutting_down)
+        pthread_cond_wait(&buffer->not_full, &buffer->mutex);
+
+    if (buffer->shutting_down) {
+        pthread_mutex_unlock(&buffer->mutex);
+        return -1;
+    }
+
+    buffer->items[buffer->tail] = *item;
+    buffer->tail = (buffer->tail + 1) % LOG_BUFFER_CAPACITY;
+    buffer->count++;
+
+    pthread_cond_signal(&buffer->not_empty);
+    pthread_mutex_unlock(&buffer->mutex);
+    return 0;
+}
 /*
  * TODO:
  * Implement consumer-side removal from the bounded buffer.
@@ -305,9 +318,23 @@ int bounded_buffer_push(bounded_buffer_t *buffer, const log_item_t *item)
  */
 int bounded_buffer_pop(bounded_buffer_t *buffer, log_item_t *item)
 {
-    (void)buffer;
-    (void)item;
-    return -1;
+    pthread_mutex_lock(&buffer->mutex);
+
+    while (buffer->count == 0 && !buffer->shutting_down)
+        pthread_cond_wait(&buffer->not_empty, &buffer->mutex);
+
+    if (buffer->count == 0 && buffer->shutting_down) {
+        pthread_mutex_unlock(&buffer->mutex);
+        return -1;
+    }
+
+    *item = buffer->items[buffer->head];
+    buffer->head = (buffer->head + 1) % LOG_BUFFER_CAPACITY;
+    buffer->count--;
+
+    pthread_cond_signal(&buffer->not_full);
+    pthread_mutex_unlock(&buffer->mutex);
+    return 0;
 }
 
 /*
@@ -321,10 +348,22 @@ int bounded_buffer_pop(bounded_buffer_t *buffer, log_item_t *item)
  */
 void *logging_thread(void *arg)
 {
-    (void)arg;
+    supervisor_ctx_t *ctx = (supervisor_ctx_t *)arg;
+    log_item_t item;
+
+    while (bounded_buffer_pop(&ctx->log_buffer, &item) == 0) {
+        char path[PATH_MAX];
+        snprintf(path, sizeof(path), "%s/%s.log", LOG_DIR, item.container_id);
+
+        FILE *f = fopen(path, "a");
+        if (f) {
+            fwrite(item.data, 1, item.length, f);
+            fclose(f);
+        }
+    }
+
     return NULL;
 }
-
 /*
  * TODO:
  * Implement the clone child entrypoint.
@@ -338,7 +377,32 @@ void *logging_thread(void *arg)
  */
 int child_fn(void *arg)
 {
-    (void)arg;
+    child_config_t *cfg = (child_config_t *)arg;
+
+    sethostname(cfg->id, strlen(cfg->id));
+
+    if (chroot(cfg->rootfs) != 0) {
+        perror("chroot");
+        return 1;
+    }
+
+    chdir("/");
+
+    if (mount("proc", "/proc", "proc", 0, NULL) != 0) {
+        perror("mount proc");
+        return 1;
+    }
+
+    dup2(cfg->log_write_fd, STDOUT_FILENO);
+    dup2(cfg->log_write_fd, STDERR_FILENO);
+    close(cfg->log_write_fd);
+
+    printf("[LOG] %s: container started\n", cfg->id);
+    fflush(stdout);
+
+    execl("/bin/sh", "sh", "-c", cfg->command, (char *)NULL);
+
+    perror("exec");
     return 1;
 }
 
@@ -387,6 +451,19 @@ int unregister_from_monitor(int monitor_fd, const char *container_id, pid_t host
  *   - accept control requests and update container state
  *   - reap children and respond to signals
  */
+
+static void handle_sigchld(int sig) {
+    (void)sig;
+    int status;
+    while (waitpid(-1, &status, WNOHANG) > 0);
+}
+static volatile sig_atomic_t stop_flag = 0;
+
+static void handle_sigint(int sig) {
+    (void)sig;
+    stop_flag = 1;
+}
+
 static int run_supervisor(const char *rootfs)
 {
     supervisor_ctx_t ctx;
@@ -419,13 +496,211 @@ static int run_supervisor(const char *rootfs)
      *   4) spawn the logger thread
      *   5) enter the supervisor event loop
      */
-    fprintf(stderr, "Supervisor mode not implemented yet for base-rootfs: %s\n", rootfs);
 
-    bounded_buffer_begin_shutdown(&ctx.log_buffer);
-    bounded_buffer_destroy(&ctx.log_buffer);
-    pthread_mutex_destroy(&ctx.metadata_lock);
-    return 1;
+    // 1. open monitor
+    ctx.monitor_fd = open("/dev/container_monitor", O_RDWR);
+    if (ctx.monitor_fd < 0) {
+        perror("monitor open failed (continuing without monitor)");
+    }
+    
+    // 2. create socket
+    ctx.server_fd = socket(AF_UNIX, SOCK_STREAM, 0);
+    if (ctx.server_fd < 0) {
+        perror("socket");
+        return 1;
+    }
+    
+    struct sockaddr_un addr;
+    memset(&addr, 0, sizeof(addr));
+    addr.sun_family = AF_UNIX;
+    strncpy(addr.sun_path, CONTROL_PATH, sizeof(addr.sun_path) - 1);
+    
+    unlink(CONTROL_PATH);
+    
+    if (bind(ctx.server_fd, (struct sockaddr *)&addr, sizeof(addr)) != 0) {
+        perror("bind");
+        return 1;
+    }
+    
+    if (listen(ctx.server_fd, 8) != 0) {
+        perror("listen");
+        return 1;
+    }
+    
+    // 3. signals
+    signal(SIGCHLD, handle_sigchld);
+    signal(SIGINT, handle_sigint);
+    signal(SIGTERM, handle_sigint);
+    
+    // 4. logger thread
+    mkdir(LOG_DIR, 0755);
+    pthread_create(&ctx.logger_thread, NULL, logging_thread, &ctx);
+    
+    // 5. event loop
+    ctx.should_stop = 0;
+    while (!ctx.should_stop) {
+    ctx.should_stop = stop_flag;
+    int cfd = accept(ctx.server_fd, NULL, NULL);
+    if (cfd < 0) continue;
+
+    char buffer[512] = {0};
+    ssize_t n = read(cfd, buffer, sizeof(buffer) - 1);   
+    if (n <= 0) {
+        close(cfd);
+        continue;
+    }
+    buffer[n] = '\0';
+
+    char cmd[16]={0}, id[32]={0}, rootfs[128]={0}, exec_cmd[256]={0};
+    sscanf(buffer, "%15s %31s %127s %255[^\n]",   
+           cmd, id, rootfs, exec_cmd);
+
+    control_response_t resp;
+    memset(&resp, 0, sizeof(resp));
+
+    if (strcmp(cmd, "1") == 0 ) {
+
+        int pipefd[2];
+        pipe(pipefd);
+
+        child_config_t *cfg = malloc(sizeof(*cfg));
+        strcpy(cfg->id, id);
+        strcpy(cfg->rootfs, rootfs);
+        strcpy(cfg->command, exec_cmd);
+        cfg->log_write_fd = pipefd[1];
+
+        char *stack = malloc(STACK_SIZE);
+
+        int pid = clone(child_fn, stack + STACK_SIZE,
+                        CLONE_NEWPID | CLONE_NEWUTS | CLONE_NEWNS | SIGCHLD,
+                        cfg);
+
+        if (pid < 0) {
+            snprintf(resp.message, sizeof(resp.message), "clone failed");
+            free(stack);
+        } else {
+            close(pipefd[1]);
+
+            container_record_t *c = calloc(1, sizeof(*c));
+            strcpy(c->id, id);
+            c->host_pid = pid;
+            c->state = CONTAINER_RUNNING;
+            c->started_at = time(NULL);
+
+            if (ctx.monitor_fd >= 0) {   
+            if (register_with_monitor(ctx.monitor_fd, id, pid,
+                DEFAULT_SOFT_LIMIT, DEFAULT_HARD_LIMIT) < 0) {
+                perror("monitor register failed");
+            }
+        }           
+
+            pthread_mutex_lock(&ctx.metadata_lock);
+            c->next = ctx.containers;
+            ctx.containers = c;
+            pthread_mutex_unlock(&ctx.metadata_lock);
+
+            pthread_t t;
+            typedef struct {
+                int fd;
+                char id[CONTAINER_ID_LEN];
+            } reader_arg_t;
+            
+            reader_arg_t *rarg = malloc(sizeof(*rarg));
+            rarg->fd = pipefd[0];
+            strncpy(rarg->id, id, CONTAINER_ID_LEN - 1);
+            rarg->id[CONTAINER_ID_LEN - 1] = '\0';
+            
+            pthread_create(&t, NULL, (void *(*)(void *))({
+            void *fn(void *arg) {
+                reader_arg_t *r = arg;
+        
+                char buf[LOG_CHUNK_SIZE];
+                ssize_t n;
+        
+                while ((n = read(r->fd, buf, sizeof(buf))) > 0) {
+                    log_item_t item;
+                    memset(&item, 0, sizeof(item));
+        
+                    strncpy(item.container_id, r->id, CONTAINER_ID_LEN - 1);
+                    memcpy(item.data, buf, n);
+                    item.length = n;
+        
+                    bounded_buffer_push(&ctx.log_buffer, &item);
+                }
+        
+                close(r->fd);
+                free(r);
+                return NULL;
+            }
+            fn;
+        }), rarg);
+
+            pthread_detach(t);
+
+            snprintf(resp.message, sizeof(resp.message), "Started PID %d", pid);
+        }
+    }
+
+    else if (strcmp(cmd, "3") == 0) {
+        char out[512] = "";
+        pthread_mutex_lock(&ctx.metadata_lock);
+
+        for (container_record_t *c = ctx.containers; c; c = c->next) {
+            char line[128];
+            sprintf(line, "%s PID:%d STATE:%s\n",
+                    c->id, c->host_pid, state_to_string(c->state));
+            strncat(out, line, sizeof(out) - strlen(out) - 1);
+        }
+
+        pthread_mutex_unlock(&ctx.metadata_lock);
+        snprintf(resp.message, sizeof(resp.message), "%s", out);
+    }
+
+    else if (strcmp(cmd, "5") == 0) {
+        pthread_mutex_lock(&ctx.metadata_lock);
+
+        for (container_record_t *c = ctx.containers; c; c = c->next) {
+            if (strcmp(c->id, id) == 0) {
+                kill(c->host_pid, SIGKILL);
+
+                unregister_from_monitor(ctx.monitor_fd,
+                        c->id,
+                        c->host_pid);
+                        c->state = CONTAINER_STOPPED;
+            }
+        }
+
+        pthread_mutex_unlock(&ctx.metadata_lock);
+        snprintf(resp.message, sizeof(resp.message), "Stopped");
+    }
+
+    else if (strcmp(cmd, "4") == 0) {
+        char path[128];
+        snprintf(path, sizeof(path) ,"logs/%s.log", id);
+
+        FILE *f = fopen(path, "r");
+        if (f) {
+            fread(resp.message, 1, sizeof(resp.message)-1, f);
+            fclose(f);
+        } else {
+            strcpy(resp.message, "No logs");
+        }
+    }
+   
+    write(cfd, &resp, sizeof(resp));
+    close(cfd);
 }
+
+        bounded_buffer_begin_shutdown(&ctx.log_buffer);
+        pthread_join(ctx.logger_thread, NULL);
+        close(ctx.server_fd);
+        if (ctx.monitor_fd >= 0) close(ctx.monitor_fd);
+        unlink(CONTROL_PATH);
+
+        bounded_buffer_destroy(&ctx.log_buffer);
+        pthread_mutex_destroy(&ctx.metadata_lock);
+        return 1;
+    }
 
 /*
  * TODO:
@@ -437,9 +712,39 @@ static int run_supervisor(const char *rootfs)
  */
 static int send_control_request(const control_request_t *req)
 {
-    (void)req;
-    fprintf(stderr, "Control-plane client path not implemented.\n");
-    return 1;
+    int s = socket(AF_UNIX, SOCK_STREAM, 0);
+    if (s < 0) {
+        perror("socket");
+        return 1;
+    }
+
+    struct sockaddr_un addr;
+    memset(&addr, 0, sizeof(addr));
+    addr.sun_family = AF_UNIX;
+    strncpy(addr.sun_path, CONTROL_PATH, sizeof(addr.sun_path) - 1);
+
+    if (connect(s, (struct sockaddr *)&addr, sizeof(addr)) != 0) {
+        perror("connect");
+        close(s);
+        return 1;
+    }
+
+    char msg[CONTROL_MESSAGE_LEN];
+    snprintf(msg, sizeof(msg), "%d %s %s %s",
+             req->kind,
+             req->container_id,
+             req->rootfs,
+             req->command);
+
+    write(s, msg, strlen(msg));
+
+    control_response_t resp;
+    if (read(s, &resp, sizeof(resp)) > 0) {
+        printf("%s\n", resp.message);
+    }
+
+    close(s);
+    return 0;
 }
 
 static int cmd_start(int argc, char *argv[])
